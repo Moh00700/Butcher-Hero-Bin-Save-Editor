@@ -376,6 +376,10 @@ function children(b, i) {
   return out;
 }
 
+/* Categories removed from the editor (their fields are hidden, never listed/searched,
+   but are preserved untouched in the save when you hit Save) */
+const REMOVED_GROUPS = new Set(['promo_codes','notifications','rescue_quest','limited_mode','mines','quests','secret_chests','meta_stats','level_pass','island_mastery','ab_tests']);
+
 /* every editable scalar (int / float / bool) under `root`, with byte offsets */
 function listFields(b, root) {
   const out = [];
@@ -383,6 +387,7 @@ function listFields(b, root) {
     const [end, kind] = vspan(b, i);
     if (kind === 'map' || kind === 'arr') {
       for (let [label, off] of children(b, i)) {
+        if (prefix.length === 0 && REMOVED_GROUPS.has(label)) continue;
         if (prefix.length === 3 && prefix[0] === 'spawners' && prefix[1] === 'spawners_v3' &&
             /^\d+$/.test(label) && +label < 7) label = SPAWNER_FIELDS[+label];
         walk(off, prefix.concat(label));
@@ -681,8 +686,6 @@ function buildSample(nowSec) {
     } },
     vip: { daily_chest_cooldown_timestamp: dayStart + 86400 },
     boss_tower: { last_tickets_restore_timestamp: dayStart - 86400 * 2, tickets: 3 },
-    quests: { steps: { quest_c1_step_1: { respawn_at_unix_seconds: dayStart + 86400 } } },
-    secret_chests: { chests: { chest_a1: { is_opened: true }, chest_b2: { is_opened: false } } },
     spawners: {
       spawners_v3: {
         'tree_1 (1)_cab298': [dayStart - 3600, 0, 2, dayStart + 86400, 1, 20400, 5],
