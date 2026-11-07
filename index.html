@@ -120,6 +120,7 @@ details.tools > summary { cursor: pointer; padding: 10px 14px; font-weight: 500;
 }
 .row.changed .num { border-color: var(--accent); }
 .row.invalid .num { border-color: var(--err); }
+textarea.num.big { flex: 1 1 100%; min-width: 0; min-height: 240px; resize: vertical; white-space: pre; overflow: auto; font-size: 12px; line-height: 1.45; }
 .switch {
   display: inline-flex; align-items: center; gap: 10px; background: var(--field); border: 1px solid var(--line); border-radius: 999px;
   padding: 4px 12px 4px 4px; min-height: 38px; font-family: var(--mono); font-size: 13px;
@@ -178,9 +179,10 @@ details.tools > summary { cursor: pointer; padding: 10px 14px; font-weight: 500;
   <header>
     <h1>Butcher Hero <span>Save Editor</span></h1>
     <div class="panel" id="top-stats" aria-label="Account summary" style="display:flex;gap:24px;flex-wrap:wrap;justify-content:center;margin:12px auto 0;max-width:640px">
-      <div><b>Playtime:</b> <span id="top-playtime">—</span></div>
-      <div><b>Installed:</b> <span id="top-install">—</span></div>
-      <div><b>Total Kills:</b> <span id="top-kills">—</span></div>
+      <div><b>Playtime:</b> <span id="top-playtime">Unknown</span></div>
+      <div><b>Installed:</b> <span id="top-install">Unknown</span></div>
+      <div><b>Total Kills:</b> <span id="top-kills">Unknown</span></div>
+      <div><b>App Version:</b> <span id="top-appversion">Unknown</span></div>
     </div>
     <p class="lead">Open your <code>game_data.bin</code>, change any value, and save it back. The integrity hash is recalculated for you. Everything runs in this page and your file is never uploaded.</p>
   </header>
@@ -354,6 +356,18 @@ function encInt(v) {
   throw new Error('integer out of range');
 }
 
+/* MessagePack string encoder (fixstr / str8 / str16) - top-level so buildEdit can use it.
+   (There is also a copy inside the page-init block for virtual fields; that one
+   shadows this one there, which is harmless.) */
+function encStr(s){
+  const b = new TextEncoder().encode(s);
+  const n = b.length;
+  const h = n < 32 ? Uint8Array.of(0xa0 | n) : n < 256 ? Uint8Array.of(0xd9, n) : Uint8Array.of(0xda, n >> 8, n & 255);
+  const out = new Uint8Array(h.length + n);
+  out.set(h, 0); out.set(b, h.length);
+  return out;
+}
+
 /* ---- walking by path ---- */
 function children(b, i) {
   const [, kind] = vspan(b, i);
@@ -383,7 +397,7 @@ function children(b, i) {
 
 /* Categories removed from the editor (their fields are hidden, never listed/searched,
    but are preserved untouched in the save when you hit Save) */
-const REMOVED_GROUPS = new Set(['promo_codes','notifications','rescue_quest','limited_mode','mines','quests','secret_chests','meta_stats','level_pass','island_mastery','ab_tests','cashback','mails','shop','player_statistics','achievements','daily_procs']);
+const REMOVED_GROUPS = new Set(['promo_codes','notifications','rescue_quest','limited_mode','mines','quests','secret_chests','meta_stats','level_pass','island_mastery','cashback','player_statistics','achievements','daily_procs']);
 
 /* String fields that are editable: the event schedule stamps. Every other
    string-valued field in the save stays untouched. */
@@ -394,9 +408,30 @@ const STRING_FIELDS = new Set([
 ]);
 function isEditableStr(path){
   if (STRING_FIELDS.has(path)) return true;
-  return path.startsWith('event_analytics/ready_stamp_by_event_key/') ||
-         path.startsWith('event_analytics/last_skipped_stamp_by_event_key/');
+  if (path.startsWith('event_analytics/ready_stamp_by_event_key/')) return true;
+  if (path.startsWith('event_analytics/last_skipped_stamp_by_event_key/')) return true;
+  // Big JSON blobs (edited in a textarea, validated as JSON)
+  if (path === 'events/snapshot_data' || path === 'ab_tests/ab_data') return true;
+  // Loadout / league features / defeated bosses / amulet seen lists (array entries)
+  if (/^player\/loadout\/\d+$/.test(path)) return true;
+  if (/^events\/shown_league_features\/\d+$/.test(path)) return true;
+  if (/^boss_tower\/defeated_bosses\/\d+$/.test(path)) return true;
+  if (/^amulet\/(seen_upgrade_keys|discovered_soul_keys)\/\d+$/.test(path)) return true;
+  // Which crystal sits in which slot
+  if (/^crystals\/crystals\/\d+\/equipped_slot_key$/.test(path)) return true;
+  // Mail dates
+  if (/^mails\/items\/[^\/]+\/(receive_time_string|expiration_time_string)$/.test(path)) return true;
+  // Shop chest timers
+  if (path === 'shop/next_free_claim_reset') return true;
+  if (path.startsWith('shop/free_chest_claim_reset/')) return true;
+  // A/B test variant letters
+  if (path.startsWith('ab_tests/tests/')) return true;
+  return false;
 }
+/* Deliberately NOT editable (even though they are strings):
+   user/user_id, user/device_model, user/app_version - account/device identity.
+   player/items/.../key, player/item_slots/.../slot_key, stats modifiers name,
+   spawner names - identity keys; renaming one breaks every reference to it. */
 /* every editable scalar (int / float / bool) under `root`, with byte offsets */
 function listFields(b, root) {
   const out = [];
@@ -560,7 +595,18 @@ function buildEdit(f, text, now) {
     return { bytes: Uint8Array.of(['true', '1'].includes(t) ? 0xc3 : 0xc2), shown: t === 'true' || t === '1' };
   }
   if (f.kind === 'str') {
-    if (text === '') throw new Error('enter some text');
+    if (text === '') {
+      // Empty is valid for equipped_slot_key: it means "not equipped".
+      if (/\/equipped_slot_key$/.test(f.path)) return { bytes: encStr(''), shown: '' };
+      throw new Error('enter some text');
+    }
+    // Big JSON blobs: events/snapshot_data (~15KB), ab_tests/ab_data (~3KB)
+    if (f.path === 'events/snapshot_data' || f.path === 'ab_tests/ab_data') {
+      if (text.length > 100000) throw new Error('text too long (max 100,000 chars)');
+      if (text.includes('\u0000')) throw new Error('NUL characters are not allowed');
+      try { JSON.parse(text); } catch (e) { throw new Error('must be valid JSON: ' + (e.message || e)); }
+      return { bytes: encStr(text), shown: text };
+    }
     if (text.length > 200) throw new Error('text too long (max 200 chars)');
     if (/[\u0000-\u001f]/.test(text)) throw new Error('no control characters allowed');
     if (f.path.includes('_stamp')) {
@@ -569,6 +615,16 @@ function buildEdit(f, text, now) {
       if (!/^.+_\d+$/.test(text)) throw new Error('must look like crystal_event_roster_1793128498');
     } else if (f.path.endsWith('/active_event_key')) {
       if (/\s/.test(text)) throw new Error('no spaces allowed in the event key');
+    } else if (f.path.endsWith('/receive_time_string') || f.path.endsWith('/expiration_time_string')) {
+      if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(text)) throw new Error('mail date must look like 2026-10-25 01:01');
+    } else if (f.path === 'shop/next_free_claim_reset' || f.path.startsWith('shop/free_chest_claim_reset/')) {
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(text)) throw new Error('shop time must look like 2026-11-07T00:00:00.0000000Z');
+    } else if (f.path.startsWith('ab_tests/tests/')) {
+      if (!/^[A-H]$/.test(text)) throw new Error('A/B test variant must be a single letter A-H');
+    } else if (/\/equipped_slot_key$/.test(f.path)) {
+      if (!/^(crystal_slot_[1-5])?$/.test(text)) throw new Error('must be empty or crystal_slot_1 .. crystal_slot_5');
+    } else if (/\/loadout\/\d+$/.test(f.path) || /^boss_tower\/defeated_bosses\/\d+$/.test(f.path)) {
+      if (/\s/.test(text)) throw new Error('no spaces allowed in an item / boss key');
     }
     return { bytes: encStr(text), shown: text };
   }
@@ -794,16 +850,29 @@ if (typeof module !== 'undefined') {
     }catch(e){ return null; }
   }
   function updateTopStats(){
+    // The page starts on the EXAMPLE save (total_kills: 1234 is baked into it).
+    // Never present example values as yours: until a real game_data.bin loads,
+    // every summary field stays Unknown.
+    if (st.sample) {
+      for (const id of ['top-playtime', 'top-install', 'top-kills', 'top-appversion']) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = 'Unknown';
+      }
+      return;
+    }
     const pt = topFieldValue('user/playtime_minutes');
     const ins = topFieldValue('user/install_time');
     const kills = rawTopValue('player_statistics/total_kills');
+    const ver = rawTopValue('user/app_version');
+    const verEl = document.getElementById('top-appversion');
+    if(verEl) verEl.textContent = (ver===null||ver===undefined||ver==='') ? 'Unknown' : String(ver);
     const killsEl = document.getElementById('top-kills');
-    if(killsEl) killsEl.textContent = (kills===null||kills===undefined) ? '—' : Number(kills).toLocaleString();
+    if(killsEl) killsEl.textContent = (kills===null||kills===undefined) ? 'Unknown' : Number(kills).toLocaleString();
     const ptEl = document.getElementById('top-playtime'), insEl = document.getElementById('top-install');
-    if(ptEl) ptEl.textContent = (pt===null||pt===undefined) ? '—' : (Number(pt)/1440).toFixed(2)+' days ('+Number(pt).toLocaleString()+' min)';
+    if(ptEl) ptEl.textContent = (pt===null||pt===undefined) ? 'Unknown' : (Number(pt)/1440).toFixed(2)+' days ('+Number(pt).toLocaleString()+' min)';
     if(insEl){
-      if(ins===null||ins===undefined || Number(ins)<=0) insEl.textContent='—';
-      else { let sec=Number(ins); if(sec>1e17) sec=(sec-621355968000000000)/1e7; else if(sec>1e11) sec=sec/1000; const d=new Date(sec*1000); insEl.textContent = isNaN(d) ? '—' : d.toISOString().slice(0,10)+' ('+d.toISOString().slice(0,16).replace('T',' ')+' UTC)'; }
+      if(ins===null||ins===undefined || Number(ins)<=0) insEl.textContent='Unknown';
+      else { let sec=Number(ins); if(sec>1e17) sec=(sec-621355968000000000)/1e7; else if(sec>1e11) sec=sec/1000; const d=new Date(sec*1000); insEl.textContent = isNaN(d) ? 'Unknown' : d.toISOString().slice(0,10)+' ('+d.toISOString().slice(0,16).replace('T',' ')+' UTC)'; }
     }
   }
 
@@ -934,6 +1003,17 @@ if (typeof module !== 'undefined') {
     if (path.includes('crystals/slots/') && path.endsWith('/is_unlocked')) return { cat:'Crystals & VIP', name:'Crystal Slot — Unlocked', desc:'Amulet / crystal slot. True = unlocked.' };
     if (path.includes('item_slots/') && path.endsWith('/is_unlocked')) return { cat:'Weapons & Gear', name:'Item Slot — Unlocked', desc:'Gear slot. weapon_5_vip = 5th VIP weapon slot.' };
     if (path.includes('level_pass') && path.endsWith('/purchased')) return { cat:'Crystals & VIP', name:'Level Pass — Purchased', desc:'Season / level pass bought.' };
+    if (path.startsWith('player/loadout/')) return { cat:'Weapons & Gear', name:'Loadout Slot', desc:'Equipped item key for this loadout slot. Use a real item key (e.g. doubleaxe, slime_spawn).' };
+    if (path.startsWith('events/shown_league_features/')) return { cat:'Events', name:'Shown League Feature', desc:'A league feature the game already showed you. Feature key, e.g. gold_perk_pool.' };
+    if (path.startsWith('boss_tower/defeated_bosses/')) return { cat:'Boss Tower', name:'Defeated Boss', desc:'A boss already beaten in Boss Tower. Boss key, e.g. hydra, lich.' };
+    if (path.startsWith('amulet/seen_upgrade_keys/')) return { cat:'Amulet', name:'Seen Amulet Upgrade', desc:'An amulet upgrade you have already seen. Upgrade key.' };
+    if (path.startsWith('amulet/discovered_soul_keys/')) return { cat:'Amulet', name:'Discovered Soul Tier', desc:'A soul tier discovered for the amulet. e.g. common, huge, chaotic.' };
+    if (path.endsWith('/equipped_slot_key')) return { cat:'Crystals & VIP', name:'Crystal — Equipped Slot', desc:'Which crystal slot this crystal sits in. Empty = not equipped, or crystal_slot_1 .. crystal_slot_5.' };
+    if (path.endsWith('/receive_time_string') || path.endsWith('/expiration_time_string')) return { cat:'Mail', name:'Mail Date', desc:'Mail receive / expiry date, as YYYY-MM-DD HH:MM.' };
+    if (path.startsWith('shop/')) return { cat:'Shop', name:'Shop Timer', desc:'Shop / free-chest reset time, as ISO UTC, e.g. 2026-11-07T00:00:00.0000000Z.' };
+    if (path.startsWith('ab_tests/tests/')) return { cat:'A/B Tests', name:'A/B Test Variant', desc:'Which variant of this experiment you are in. Single letter A-H. Changing it changes the experiment behaviour.' };
+    if (path === 'ab_tests/ab_data') return { cat:'A/B Tests', name:'A/B Test Data (JSON)', desc:'Full A/B test config as JSON. Big text — edit carefully, must stay valid JSON.' };
+    if (path === 'events/snapshot_data') return { cat:'Events', name:'Event Snapshot (JSON)', desc:'Full golem / boss event snapshot as JSON (~15KB). Golem HP/damage, boss list, rewards. Big text — must stay valid JSON.' };
     return null;
   }
   function valueLabelFor(f, cur){
@@ -965,6 +1045,8 @@ if (typeof module !== 'undefined') {
     if (f.kind === 'bool') {
       const on = cur === 'true';
       ctl = '<button class="switch" type="button" role="switch" aria-checked="' + on + '" data-act="toggle" aria-label="' + esc(f.path) + '"><i></i><span>' + (on ? 'true' : 'false') + '</span></button>';
+    } else if (f.kind === 'str' && (f.path === 'events/snapshot_data' || f.path === 'ab_tests/ab_data')) {
+      ctl = '<textarea class="num big" autocomplete="off" spellcheck="false" data-act="input" id="f' + i + '" aria-label="' + esc(f.path) + '" rows="12">' + esc(cur) + '</textarea>';
     } else {
       ctl = '<input class="num" type="text" inputmode="text" autocomplete="off" spellcheck="false" data-act="input" id="f' + i + '" value="' + esc(cur) + '" aria-label="' + esc(f.path) + '">';
       if (st.timers.has(i)) {
