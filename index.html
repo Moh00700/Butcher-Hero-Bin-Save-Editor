@@ -1399,6 +1399,50 @@ if (typeof module !== 'undefined') {
     for(const [k, vOff] of children(b, mapOff)){ if(k===key) return vOff; }
     return -1;
   }
+  /* Append tail bytes (key+value for a map, one element for an array) to the
+     end of the container at contOff, bumping its count. Handles fixmap /
+     fixarray, map16 / array16 and map32 / array32 headers. The old code
+     assumed a 1-byte header whenever the count was >= 15, which corrupted
+     containers the game already wrote as map16 / array16 (e.g.
+     currency/balances with 18 entries) and made every later save fail with
+     "expected a string key". */
+  function appendToContainer(b, contOff, tail){
+    const [cnt] = header(b, contOff);
+    const kind = vspan(b, contOff)[1];
+    const isMap = kind === 'map';
+    const contEnd = skip(b, contOff);
+    const t = b[contOff];
+    if ((t >= 0x80 && t <= 0x8f) || (t >= 0x90 && t <= 0x9f)) {
+      // fix header: 1 byte
+      if (cnt < 15) {
+        const out = concatBytes([b.subarray(0, contEnd), tail, b.subarray(contEnd)]);
+        out[contOff] = t + 1;
+        return out;
+      }
+      // cnt == 15: promote to a 16-bit header (grows the header by 2 bytes)
+      const nh = Uint8Array.of(isMap ? 0xde : 0xdc, 0, 16);
+      return concatBytes([b.subarray(0, contOff), nh, b.subarray(contOff + 1, contEnd), tail, b.subarray(contEnd)]);
+    }
+    if (t === 0xde || t === 0xdc) {
+      // 16-bit header: patch the count in place, length unchanged
+      if (cnt + 1 > 65535) throw new Error('container too large');
+      const out = concatBytes([b.subarray(0, contEnd), tail, b.subarray(contEnd)]);
+      out[contOff + 1] = (cnt + 1) >> 8;
+      out[contOff + 2] = (cnt + 1) & 0xff;
+      return out;
+    }
+    if (t === 0xdf || t === 0xdd) {
+      // 32-bit header: patch the count in place
+      const out = concatBytes([b.subarray(0, contEnd), tail, b.subarray(contEnd)]);
+      const n = cnt + 1;
+      out[contOff + 1] = (n >>> 24) & 0xff;
+      out[contOff + 2] = (n >>> 16) & 0xff;
+      out[contOff + 3] = (n >>> 8) & 0xff;
+      out[contOff + 4] = n & 0xff;
+      return out;
+    }
+    throw new Error('bad container header at ' + contOff);
+  }
   function ensureMap(b, parentPath){
     // returns { bytes, mapOff } - creates intermediate maps if missing
     if(!parentPath) { const d=parts(b).d; return { bytes:b, mapOff:d }; }
@@ -1411,16 +1455,7 @@ if (typeof module !== 'undefined') {
       if(childOff===-1){
         // create empty map for seg in curOff
         const keyB=encStr(seg); const emptyMap=Uint8Array.of(0x80);
-        const parentEnd=skip(curBytes, curOff);
-        const [cnt]=header(curBytes, curOff);
-        let nb;
-        if(cnt<15){ nb=concatBytes([curBytes.subarray(0,parentEnd), keyB, emptyMap, curBytes.subarray(parentEnd)]); nb[curOff]=0x80|(cnt+1); }
-        else { // expand 0x8f -> 0xde + u16
-          const newHeader=Uint8Array.of(0xde, 0, 16);
-          nb=concatBytes([curBytes.subarray(0,curOff), newHeader, curBytes.subarray(curOff+1,parentEnd), keyB, emptyMap, curBytes.subarray(parentEnd)]);
-          // curOff stays same (header grew, but offsets after shift - re-walk from start is safer, so recompute by re-walking)
-        }
-        curBytes=nb;
+        curBytes=appendToContainer(curBytes, curOff, concatBytes([keyB, emptyMap]));
         // re-walk from root to current seg to get correct offset after possible shift
         curOff=parts(curBytes).d;
         for(let r=0;r<=si;r++){ curOff=findChild(curBytes, curOff, segs[r]); }
@@ -1439,11 +1474,7 @@ if (typeof module !== 'undefined') {
     let { bytes: b, mapOff } = ensureMap(bytes, parentPath);
     if(findChild(b, mapOff, key)!==-1) return b; // already exists
     const keyB=encStr(key); const valB=encVal(kind, text);
-    const parentEnd=skip(b, mapOff); const [cnt]=header(b, mapOff);
-    let out;
-    if(cnt<15){ out=concatBytes([b.subarray(0,parentEnd), keyB, valB, b.subarray(parentEnd)]); out[mapOff]=0x80|(cnt+1); }
-    else { const newHeader=Uint8Array.of(0xde, 0, cnt+1); out=concatBytes([b.subarray(0,mapOff), newHeader, b.subarray(mapOff+1,parentEnd), keyB, valB, b.subarray(parentEnd)]); }
-    return out;
+    return appendToContainer(b, mapOff, concatBytes([keyB, valB]));
   }
   function upsertScalar(bytes, fullPath, kind, text){
     const idx=fullPath.lastIndexOf('/'); const parentPath=fullPath.slice(0,idx); const key=fullPath.slice(idx+1);
@@ -1484,9 +1515,7 @@ if (typeof module !== 'undefined') {
         if(findChild(b, mapOff, 'slots')!==-1){ out=b; continue; }
         const slots=[]; for(let i=1;i<=5;i++) slots.push({slot_key:'crystal_slot_'+i, is_unlocked:true});
         const keyB=encStr('slots'); const valB=mpEncode(slots);
-        const parentEnd=skip(b, mapOff); const [cnt]=header(b, mapOff);
-        if(cnt<15){ out=concatBytes([b.subarray(0,parentEnd), keyB, valB, b.subarray(parentEnd)]); out[mapOff]=0x80|(cnt+1); }
-        else { const nh=Uint8Array.of(0xde,0,cnt+1); out=concatBytes([b.subarray(0,mapOff), nh, b.subarray(mapOff+1,parentEnd), keyB, valB, b.subarray(parentEnd)]); }
+        out=appendToContainer(b, mapOff, concatBytes([keyB, valB]));
         continue;
       }
       if(p==='__slots__/player/item_slots/weapon_5_vip'){
@@ -1494,18 +1523,14 @@ if (typeof module !== 'undefined') {
         const arrOff=findChild(b, mapOff, 'item_slots');
         if(arrOff===-1){
           const keyB=encStr('item_slots'); const valB=mpEncode([{slot_key:'weapon_5_vip', is_unlocked:true}]);
-          const parentEnd=skip(b, mapOff); const [cnt]=header(b, mapOff);
-          if(cnt<15){ out=concatBytes([b.subarray(0,parentEnd), keyB, valB, b.subarray(parentEnd)]); out[mapOff]=0x80|(cnt+1); }
-          else { const nh=Uint8Array.of(0xde,0,cnt+1); out=concatBytes([b.subarray(0,mapOff), nh, b.subarray(mapOff+1,parentEnd), keyB, valB, b.subarray(parentEnd)]); }
+          out=appendToContainer(b, mapOff, concatBytes([keyB, valB]));
           continue;
         }
         // array exists: check if weapon_5_vip already there (by scanning children)
         let exists=false; for(const [lab, off] of children(b, arrOff)){ for(const [k2, v2] of children(b, off)){ if(k2==='slot_key' && vspan(b,v2)[1]==='str' && rdstr(b,v2)[0]==='weapon_5_vip') exists=true; } }
         if(exists){ out=b; continue; }
         const elem=mpEncode({slot_key:'weapon_5_vip', is_unlocked:true});
-        const arrEnd=skip(b, arrOff); const [acnt]=header(b, arrOff);
-        if(acnt<15){ out=concatBytes([b.subarray(0,arrEnd), elem, b.subarray(arrEnd)]); out[arrOff]=0x90|(acnt+1); }
-        else { const nh=Uint8Array.of(0xdc,0,acnt+1); out=concatBytes([b.subarray(0,arrOff), nh, b.subarray(arrOff+1,arrEnd), elem, b.subarray(arrEnd)]); }
+        out=appendToContainer(b, arrOff, elem);
         continue;
       }
       const vf=VIRTUAL_FIELDS.find(v=>v.path===p); if(!vf) continue;
